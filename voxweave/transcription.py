@@ -547,6 +547,12 @@ def _find_speech(
     run.rep.step("find speech")
     run.rep.stage("VAD chunking")
     segs = vad_speech_segments(wav)
+    # A second, low-threshold pass over the silence gaps: brief interjections between two
+    # lines are missed by the chunking threshold, and the aligner then has no span to place
+    # their words in (see chunking.rescue_gap_speech).
+    from voxweave.chunking import rescue_gap_speech
+
+    segs = rescue_gap_speech(wav, segs, song_spans=tuple(song_spans))
     plan = _plan_chunks(
         wav,
         segs,

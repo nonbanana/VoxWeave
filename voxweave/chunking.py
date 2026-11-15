@@ -6,7 +6,11 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import logging
+
 import soundfile as sf
+
+log = logging.getLogger("voxweave")
 
 from voxweave import config
 from voxweave.align_failures import CanonicalFailure
@@ -417,6 +421,77 @@ def vad_speech_segments(
         ),
         speech_pad_ms=100,
     )
+
+
+def rescue_gap_speech(
+    wav_path: Path,
+    segments: list[dict],
+    *,
+    song_spans: Sequence[tuple[float, float]] = (),
+    gap_min_s: float = 0.35,
+    threshold: float = 0.25,
+    min_speech_s: float = 0.15,
+) -> list[dict]:
+    """Second VAD pass over the silence gaps, at a threshold that catches short bursts.
+
+    The chunking pass runs silero at its default 0.5 because a low threshold invents
+    speech on loud BGM. That setting also drops brief interjections between two lines
+    (a 0.5 s ``壁…`` in a one-second pause), and the aligner then has no span to put the
+    word in: it parks the text on the neighbouring line, where it reads as if the previous
+    speaker said it. Re-checking only the gaps keeps the false-positive risk where it can
+    be reviewed -- gaps are silence by definition, so anything found there is at least not
+    competing with real speech.
+
+    ``song_spans`` are skipped: music is exactly what the high threshold protects against.
+    Returns the merged, time-ordered segments.
+    """
+    if not segments:
+        return segments
+    import torch
+    from silero_vad import get_speech_timestamps
+
+    try:
+        data, sr = sf.read(str(wav_path), dtype="float32")
+    except Exception as exc:  # noqa: BLE001 - an optional quality pass must not fail the run
+        log.debug("gap rescue skipped: cannot read %s (%s)", wav_path, exc)
+        return segments
+    if sr != SAMPLE_RATE:
+        log.debug("gap rescue skipped: expected %d Hz, got %r", SAMPLE_RATE, sr)
+        return segments
+    audio_end = len(data) / sr
+    model = _get_silero_vad()
+    added: list[tuple[float, float]] = []
+    for gap_start, gap_end in silence_gaps(segments, audio_end=audio_end):
+        if gap_end - gap_start < gap_min_s:
+            continue
+        if any(a < gap_end and gap_start < b for a, b in song_spans):
+            continue
+        slab = torch.from_numpy(data[int(gap_start * sr) : int(gap_end * sr)])
+        for found in get_speech_timestamps(
+            slab,
+            model,
+            sampling_rate=SAMPLE_RATE,
+            return_seconds=True,
+            threshold=threshold,
+            min_silence_duration_ms=100,
+            speech_pad_ms=50,
+        ):
+            start = gap_start + float(found["start"])
+            end = gap_start + float(found["end"])
+            if end - start >= min_speech_s:
+                added.append((start, end))
+    if not added:
+        return segments
+    merged = [(float(s["start"]), float(s["end"])) for s in segments] + added
+    merged.sort()
+    out: list[dict] = []
+    for start, end in merged:
+        if out and start <= float(out[-1]["end"]):
+            out[-1]["end"] = max(float(out[-1]["end"]), end)
+        else:
+            out.append({"start": start, "end": end})
+    log.info("speech rescue: %d gap burst(s) added by the low-threshold pass", len(added))
+    return out
 
 
 def silence_gaps(
