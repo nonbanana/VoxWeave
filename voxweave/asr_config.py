@@ -68,6 +68,29 @@ def _text_config(cfg: Any) -> Any | None:
     return getattr(thinker, "text_config", None) if thinker is not None else None
 
 
+def nest_flat_thinker(cfg: Any) -> bool:
+    """Move a flat ``text_config``/``audio_config`` back under ``thinker_config``.
+
+    A flat export leaves ``thinker_config`` at its class defaults, so the model is built
+    with the wrong sizes; the tower the checkpoint actually trained is the top-level dict.
+    Only the converter needs this (it writes the resulting config), never a plain load.
+    """
+    flat_text = getattr(cfg, "text_config", None)
+    thinker = getattr(cfg, "thinker_config", None)
+    if thinker is None or not isinstance(flat_text, Mapping):
+        return False
+    kwargs: dict[str, Any] = {"text_config": dict(flat_text)}
+    flat_audio = getattr(cfg, "audio_config", None)
+    if isinstance(flat_audio, Mapping):
+        kwargs["audio_config"] = dict(flat_audio)
+    for key in ("audio_token_id", "audio_start_token_id", "user_token_id", "initializer_range"):
+        value = getattr(cfg, key, None)
+        if value is not None:
+            kwargs[key] = value
+    cfg.thinker_config = type(thinker)(**kwargs)
+    return True
+
+
 def repair_qwen_asr_config(cfg: Any) -> list[str]:
     """Fill the fields ``qwen_asr`` requires from ``cfg`` in place.
 

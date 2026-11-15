@@ -965,6 +965,14 @@ _SHOT_SNAP_DEFAULT_MS = (
 )
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Boolean env switch: unset -> ``default``; 1/true/yes/on vs 0/false/no/off."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     """Integer env knob; unset/blank -> ``default``. A malformed value also falls back
     to ``default`` (never raises: import-time knobs would break every command, even

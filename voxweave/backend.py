@@ -216,14 +216,7 @@ def _get_asr(asr_model: str | None = None):
         # Stop before paying for the load.
         foreign = foreign_weight_layout(local)
         if foreign is not None:
-            raise RuntimeError(
-                f"{mid} stores its weights as '{foreign}.*', but Qwen3-ASR loads"
-                f" '{EXPECTED_WEIGHT_PREFIX}.*'; transformers would random-initialise the"
-                " model and transcribe nonsense. This checkpoint needs converting (rename"
-                " 'model.' -> 'thinker.model.', 'language_model.' -> 'model.',"
-                " 'multi_modal_projector' -> 'audio_tower.proj1/proj2', and restore the"
-                " tied lm_head), or use Qwen/Qwen3-ASR-1.7B instead."
-            )
+            local = _converted_asr_snapshot(mid, Path(local), foreign)
         load_kwargs = {"dtype": _model_dtype(dev), "device_map": dev}
         params = inspect.signature(Qwen3ASRModel.from_pretrained).parameters
         if "max_new_tokens" in params:
@@ -242,6 +235,38 @@ def _get_asr(asr_model: str | None = None):
     if hasattr(_asr, "max_inference_batch_size"):  # already loaded / older signature
         _asr.max_inference_batch_size = batch
     return _asr
+
+
+def _converted_asr_snapshot(mid: str, local: Path, foreign: str) -> Path:
+    """Path to a loadable copy of ``local``, converting it once into the ASR cache.
+
+    A checkpoint exported for another runtime names its towers differently; transformers
+    would random-initialise it and transcribe nonsense (see voxweave.asr_convert). The
+    converted copy is cached, so the 3.4 GB rewrite happens on the first run only.
+    VOXWEAVE_ASR_NO_CONVERT=1 keeps the old refuse-and-explain behaviour for anyone who
+    would rather fix the checkpoint themselves.
+    """
+    from voxweave.asr_convert import convert_snapshot, converted_dir
+
+    if config._env_flag("VOXWEAVE_ASR_NO_CONVERT", False):
+        raise RuntimeError(
+            f"{mid} stores its weights as '{foreign}.*', but Qwen3-ASR loads"
+            f" '{EXPECTED_WEIGHT_PREFIX}.*'; transformers would random-initialise the"
+            " model and transcribe nonsense. Unset VOXWEAVE_ASR_NO_CONVERT to let"
+            " voxweave convert it, or use Qwen/Qwen3-ASR-1.7B instead."
+        )
+    target = converted_dir(config.ASR_CACHE, mid)
+    if (target / ".complete").is_file():
+        log.info("using converted checkpoint %s", target)
+        return target
+    log.warning(
+        "%s stores its weights as '%s.*'; converting it once into %s"
+        " (this takes a few minutes and ~4 GB of disk)",
+        mid,
+        foreign,
+        target,
+    )
+    return convert_snapshot(local, target)
 
 
 def _resolve_align_lang(lang: str | None, source: str) -> str:
