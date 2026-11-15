@@ -246,6 +246,45 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 
 </details>
 
+### Local llama.cpp server (MoE weights in system RAM)
+
+`translate` needs nothing but an OpenAI-compatible endpoint, so a local `llama-server` is
+enough: no cloud key, no rate limit, nothing leaving the machine. For a Mixture-of-Experts
+model it pays to let llama.cpp keep the expert tensors in system RAM and everything else on
+the card -- only the router-selected experts do matmuls, so offloading them is what lets a
+30B-class MoE run on 8 GB.
+
+```bash
+llama-server -m Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8000 --jinja \
+  -ngl 99 --n-cpu-moe 28 -c 16384
+```
+
+- `-ngl 99` keeps every layer's attention, norms, router and shared expert on the GPU.
+- `--n-cpu-moe N` keeps the expert weights of the first N layers in RAM. Raise N until the
+  server starts inside your card's budget; every step trades speed for VRAM. `--cpu-moe`
+  moves all expert weights and is the fallback for a card that cannot hold even one layer's.
+- `-c` must cover the prompt. With `--concurrency 1` the whole episode goes out as one
+  request -- a 400-cue episode is roughly 20-30k tokens including the JSON envelope -- so
+  size the context for that, not for a chat.
+
+Point voxweave at it (see the configuration block above):
+
+```toml
+[llm]
+base_url = "http://127.0.0.1:8000/v1"
+model = "auto"          # or the exact served id from /v1/models
+api_key_env = ""
+concurrency = 1         # one whole-episode request: best consistency, no window seams
+```
+
+**Speaker-aware translation.** What the model sees per line matters as much as model size:
+untagged dialogue makes every line an unanchored utterance, which is where pronoun and
+register mistakes come from. Name the diarized speakers once (`voxweave speakers`); the VTT
+then carries `<v Name>` tags, and `translate` sends each cue with its speaker attached. A
+cue that holds two speakers is a dash cue, and each half is translated as its own unit so
+the two voices cannot bleed into each other.
+
 ## Export
 
 `voxweave export <subtitle>` — convert between subtitle formats: VTT/SRT/ASS/SSA in,
