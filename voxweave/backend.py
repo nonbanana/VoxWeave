@@ -18,6 +18,11 @@ from voxweave.align_mms import (
     release_mms,
     uses_mms as uses_mms,  # re-export (pipeline-facing)
 )
+from voxweave.asr_config import (
+    EXPECTED_WEIGHT_PREFIX,
+    foreign_weight_layout,
+    repaired_qwen_asr_config,
+)
 from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS, LANGUAGES_WITHOUT_SPACES
 from voxweave.qwen_decode import decode_slot_times
 from voxweave.runtime import (
@@ -206,12 +211,31 @@ def _get_asr(asr_model: str | None = None):
         log.info("loading ASR=%s (text-only) on %s", mid, dev)
         # Use snapshot so model + processor both land in config.ASR_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(mid, config.ASR_CACHE)
+        # A checkpoint exported for another runtime names its towers differently, which
+        # transformers "loads" as random weights and then transcribes confident nonsense.
+        # Stop before paying for the load.
+        foreign = foreign_weight_layout(local)
+        if foreign is not None:
+            raise RuntimeError(
+                f"{mid} stores its weights as '{foreign}.*', but Qwen3-ASR loads"
+                f" '{EXPECTED_WEIGHT_PREFIX}.*'; transformers would random-initialise the"
+                " model and transcribe nonsense. This checkpoint needs converting (rename"
+                " 'model.' -> 'thinker.model.', 'language_model.' -> 'model.',"
+                " 'multi_modal_projector' -> 'audio_tower.proj1/proj2', and restore the"
+                " tied lm_head), or use Qwen/Qwen3-ASR-1.7B instead."
+            )
         load_kwargs = {"dtype": _model_dtype(dev), "device_map": dev}
         params = inspect.signature(Qwen3ASRModel.from_pretrained).parameters
         if "max_new_tokens" in params:
             load_kwargs["max_new_tokens"] = QWEN_MAX_NEW_TOKENS
         if "max_inference_batch_size" in params:
             load_kwargs["max_inference_batch_size"] = batch
+        # Some fine-tunes ship a config.json without the Qwen3 mrope layout, which
+        # qwen_asr dereferences unguarded; repair the loaded config in memory (never the
+        # snapshot on disk) and hand it to the loader. None = complete config, load as usual.
+        repaired_cfg = repaired_qwen_asr_config(local)
+        if repaired_cfg is not None:
+            load_kwargs["config"] = repaired_cfg
         _asr = Qwen3ASRModel.from_pretrained(local, **load_kwargs)
         _asr_id = mid
         log.info("ASR ready")
