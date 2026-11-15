@@ -159,10 +159,19 @@ def build_payload(blocks: list[dict]) -> list[dict]:
     for idx, b in enumerate(blocks):
         text = b["text"]
         entry = {"i": idx, "t": " ".join(text.split("\n")).strip()}
+        # The voice tag itself is stripped from ``text``; without it the model sees every
+        # line as an unanchored utterance, which is where pronoun and register mistakes
+        # come from. A stable id per speaker is enough -- it does not need a name.
+        speaker = b.get("speaker") or b.get("speakers")
+        if isinstance(speaker, str) and speaker.strip():
+            entry["sp"] = speaker.strip()
         if not b.get("lyric") and is_dash_cue(text):
             entry["parts"] = _dash_parts(text)
         out.append(entry)
     return out
+
+
+_ECHOED_SPEAKER = re.compile(r"^\s*\[?S\d+\]?\s*[:：]?\s*")
 
 
 def parse_response(raw: object) -> dict[int, str]:
@@ -178,7 +187,9 @@ def parse_response(raw: object) -> dict[int, str]:
             continue
         if idx in out:
             log.warning("duplicate index %d in translations; last one wins", idx)
-        out[idx] = txt
+        # Safety net: the prompt forbids echoing the speaker id, but a model that does it
+        # anyway must not put "[S3]" on a viewer's screen.
+        out[idx] = _ECHOED_SPEAKER.sub("", txt).strip()
     return out
 
 
@@ -344,6 +355,10 @@ def build_messages(
         "for brevity. The words on screen must carry what the line actually means in context.",
         "Preserve the cue count: never merge, split, add, or drop cues -- each source cue maps to "
         "exactly one translated cue.",
+        "When a cue carries a speaker id in 'sp', that id identifies who says the line and the "
+        "same id is always the same character: use it to keep each character's voice, pronouns, "
+        "and form of address consistent, and to resolve who 'you' and 'I' refer to. Never "
+        "translate the id and never repeat it in the translation.",
         "Keep it colloquial and concise, fit for on-screen subtitles.",
         "Only condense when the translation would be too long to read comfortably as a subtitle, "
         "and even then drop only redundancies, false starts, and hesitation fillers -- never the "
