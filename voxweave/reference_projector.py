@@ -291,7 +291,9 @@ def _segmentation_main(delivery: SegmentationDelivery) -> FrozenObject:
     if turns.present:
         if turns.value is None:
             raise ValueError("present speaker_turns carrier lacks a value")
-        value["speaker_turns"] = turns.value
+        # Same rule as the align projection: the marker only routes the cue layer, the
+        # persisted speaker set carries the identity.
+        value["speaker_turns"] = _strip_split_markers(thaw_json(turns.value))
     if (
         delivery.carriers.voiceprint_capture is not None
         and delivery.carriers.voiceprint_media is not None
