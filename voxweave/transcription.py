@@ -272,6 +272,25 @@ def _union_rescued_spans(
 # threshold has absorbed the difference on the clips checked so far; the samples
 # themselves are not identical). --no-separate reuses the chunking VAD
 # (silero default 0.5): the decoded 16k input already IS the original audio.
+def rescue_gap_spans(
+    wav_path: Path,
+    spans: list[tuple[float, float]],
+    *,
+    song_spans: list[tuple[float, float]] | tuple[tuple[float, float], ...] = (),
+) -> list[tuple[float, float]]:
+    """Tuple-span wrapper around :func:`voxweave.chunking.rescue_gap_speech`."""
+    if not spans:
+        return spans
+    from voxweave.chunking import rescue_gap_speech
+
+    rescued = rescue_gap_speech(
+        wav_path,
+        [{"start": a, "end": b} for a, b in spans],
+        song_spans=tuple(song_spans),
+    )
+    return [(float(s["start"]), float(s["end"])) for s in rescued]
+
+
 def _timing_reference_spans(
     media_path: Path,
     fullband: Path | None,
@@ -296,6 +315,11 @@ def _timing_reference_spans(
                 orig_segs, subtract_spans(plan.song_spans, speech_spans)
             )
         vad_spans = [(s["start"], s["end"]) for s in orig_segs]
+        # The same gap re-check the chunk planner runs, now on the *timing reference*:
+        # this list is what alignment is allowed to place words in, so a burst missing
+        # here is a word the aligner parks on the next line's first frame (measured:
+        # ``壁…`` at 187.0 s, absent at 0.5 threshold, present at 0.25).
+        vad_spans = rescue_gap_spans(orig16k, vad_spans, song_spans=plan.song_spans)
     else:
         vad_spans = [(s["start"], s["end"]) for s in plan.segs]
     if plan.rescued_spans:
