@@ -427,6 +427,14 @@ def _cleanup_cues(
                 c["end"] = max(cap, target)
             else:
                 c["end"] = cap
+    # A burst of cues (a crowded scene, or a diarizer run that split one line into several)
+    # can make the gap-closing step pick an end below the cue's own start:
+    # ``nxt_start - TWO_FRAME_S < start``. That writes an end before its start, which no
+    # player shows and every validator rejects. Give such a cue one frame of its own: a
+    # sub-frame overlap with the next cue is invisible, an inverted cue is not.
+    for c in out:
+        if c["end"] <= c["start"]:
+            c["end"] = c["start"] + TWO_FRAME_S
     return out
 
 
