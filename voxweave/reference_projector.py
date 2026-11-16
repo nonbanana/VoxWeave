@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import json
 import struct
 from dataclasses import dataclass
@@ -48,6 +50,24 @@ class ReferenceAlignProjectionError(ValueError):
     ) -> None:
         super().__init__(detail_code)
         self.detail_code: Literal["cue-source-map", "unit-coverage"] = detail_code
+
+
+_SPLIT_MARKER = re.compile(r"^(SPEAKER_\d+)r\d+$")
+
+
+def _strip_split_markers(turns: object) -> object:
+    """``SPEAKER_08r2`` -> ``SPEAKER_08`` (identity), leaving every other label alone."""
+    if not isinstance(turns, (list, tuple)):
+        return turns
+    out = []
+    for item in turns:
+        if isinstance(item, (list, tuple)) and len(item) >= 3 and isinstance(item[2], str):
+            match = _SPLIT_MARKER.match(item[2])
+            if match:
+                item = [*item]
+                item[2] = match.group(1)
+        out.append(item)
+    return out
 
 
 def _validate_align_projection_domain(
@@ -199,7 +219,10 @@ def _main(delivery: AlignDelivery, inputs: AlignProjectionInputs) -> FrozenObjec
     turns_present, turns = _reference_speaker_turns_value(inputs)
     if turns_present:
         assert turns is not None
-        value["speaker_turns"] = turns
+        # A split turn carries the centroid's identity plus a marker ("SPEAKER_08r2" =
+        # speaker 08, cut out of that turn). The marker is how the cue layer knows the
+        # boundary was measured; the persisted speaker set carries the identity only.
+        value["speaker_turns"] = _strip_split_markers(turns)
     if inputs.voiceprint_capture is not None and inputs.voiceprint_media is not None:
         value["voiceprint_capture"] = inputs.voiceprint_capture
         value["voiceprint_media"] = inputs.voiceprint_media

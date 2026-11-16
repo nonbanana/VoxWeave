@@ -198,8 +198,9 @@ def split_turns_by_voice(
                 out.append((p_start, p_end, label))
             else:
                 splits += 1
-                # Traceable to the turn it came from (SPEAKER_09 -> SPEAKER_09r2); names
-                # are mapped per id downstream, so an unmapped id simply has no name yet.
-                out.append((p_start, p_end, f"{label}r{group_start}"))
+                # The centroid names *who* this piece is, so the piece joins that speaker:
+                # "SPEAKER_08r2" = speaker 08, cut out of this turn. The "r2" suffix marks
+                # the split for the cue layer and is stripped before the JSON is written.
+                out.append((p_start, p_end, f"{labels[group_start]}r{group_start}"))
             group_start = i
     return out, splits
