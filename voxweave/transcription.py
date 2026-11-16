@@ -391,9 +391,17 @@ def _refine_turns_by_voice(
 
     Optional refinement: any failure (no embedder, unreadable audio, a rejected span) logs
     at debug and leaves the diarizer's turns untouched, so a run can never fail because of
-    it. Disable with VOXWEAVE_TURN_SPLIT=0.
+    it. Enable with VOXWEAVE_TURN_SPLIT=1.
+
+    **Off by default: the pairwise test does not hold up.** On episode 02 it split 75 of
+    575 turns, fragmenting one 5.9 s exchange into six pieces and cutting a phrase in half
+    ("レポート しょうが" / "ないっすね"). Re-embedding the same three utterances showed
+    why: with anime-va, two pieces of the *same* speaker scored 0.225 while two *different*
+    speakers scored 0.455, so a short piece cannot be compared to its neighbour at all.
+    The approach needs per-speaker centroids built from many samples (global clustering
+    over the episode's pieces) before it can be trusted; until then this stays opt-in.
     """
-    if not config._env_flag("VOXWEAVE_TURN_SPLIT", True):
+    if not config._env_flag("VOXWEAVE_TURN_SPLIT", False):
         return turns
     try:
         from voxweave import voiceembed
