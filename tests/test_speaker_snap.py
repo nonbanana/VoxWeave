@@ -8,7 +8,7 @@ edge with audible silence, and never further than that.
 
 from __future__ import annotations
 
-from voxweave.speaker_format import _snap_runs_to_phrases
+from voxweave.speaker_format import _snap_runs_to_pauses, _snap_runs_to_phrases
 
 
 def _atom(text: str, start: float, end: float) -> dict:
@@ -20,7 +20,7 @@ def test_a_boundary_does_not_travel_past_the_pause() -> None:
     # 0.7 s of silence after レポート, then the reply runs on without a pause.
     right = [_atom(c, 1.0 + i * 0.1, 1.1 + i * 0.1) for i, c in enumerate("しょうがない")]
     runs = [("A", left), ("B", right)]
-    out = _snap_runs_to_phrases(runs, "ja")
+    out = _snap_runs_to_pauses(runs, "ja")
     assert [("".join(a["text"] for a in ats)) for _lb, ats in out] == ["レポート", "しょうがない"]
 
 
@@ -33,9 +33,17 @@ def test_a_boundary_inside_a_word_moves_to_the_nearby_pause() -> None:
         atoms[i]["start"] += 0.6
         atoms[i]["end"] += 0.6
     runs = [("A", atoms[:6]), ("B", atoms[6:])]  # boundary one char late
-    out = _snap_runs_to_phrases(runs, "ja")
+    out = _snap_runs_to_pauses(runs, "ja")
     left = "".join(a["text"] for a in out[0][1])
     assert left in ("レポートし", "レポート"), "must land on the pause, not mid-word"
+
+
+def test_only_split_cues_use_the_pause_snap() -> None:
+    """Ordinary cues keep the phrase snap; rewriting them too cut words in half."""
+    from voxweave.speaker_format import _SPLIT_LABEL
+
+    assert _SPLIT_LABEL.search("SPEAKER_09r2")
+    assert not _SPLIT_LABEL.search("SPEAKER_09")
 
 
 def test_a_single_run_is_untouched() -> None:

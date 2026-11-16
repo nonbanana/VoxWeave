@@ -12,6 +12,7 @@ name defined here.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -56,7 +57,11 @@ BAD_TAIL_MAX_GAP_S = 0.2
 #: A speaker boundary may only sit where the voice actually pauses. Inside a turn the
 #: aligner leaves 0.03-0.05 s between atoms of one word and 0.1 s or more between words,
 #: so this floor separates "the next word" from "the next frame".
-MIN_BOUNDARY_GAP_S = 0.08
+MIN_BOUNDARY_GAP_S = 0.20
+#: A label the voice split derived from a diarizer turn (``SPEAKER_09`` -> ``SPEAKER_09r2``).
+_SPLIT_LABEL = re.compile(r"r\d+$")
+#: How many atoms a boundary may travel to reach a pause.
+MAX_BOUNDARY_MOVE_ATOMS = 2
 
 Turn = tuple[float, float, str]
 
@@ -158,6 +163,46 @@ def _absorb_tiny_runs(
 def _snap_runs_to_phrases(
     runs: list[tuple[str, list[dict]]], lang: str
 ) -> list[tuple[str, list[dict]]]:
+    """Snap run boundaries onto legal token edges so a run never cuts mid-word.
+
+    No-space langs only (space-delimited atoms are already whole words). Each
+    jieba/BudouX phrase is reassigned to its dominant speaker (by atom duration),
+    which is exactly a boundary snap: a phrase spanning a mid-word label flip
+    goes wholly to one speaker instead of splitting. Reuses the phrase-boundary
+    machinery smart_split uses (``_phrase_boundary_atoms`` -> ``phrase_atoms``).
+    """
+    from voxweave.core.layout import _no_spaces
+
+    if not _no_spaces(lang) or len(runs) < 2:
+        return runs
+    from voxweave.core.smart_split import _phrase_boundary_atoms
+
+    flat = [a for _, ats in runs for a in ats]
+    labels = [lb for lb, ats in runs for _ in ats]
+    text = "".join(a["text"] for a in flat)
+    boundaries = _phrase_boundary_atoms([{"text": a["text"]} for a in flat], text, lang)
+    edges = sorted(boundaries | {0, len(flat)})
+    new_labels = list(labels)
+    for s, e in zip(edges, edges[1:]):
+        weight: dict[str, float] = {}
+        for k in range(s, e):  # edges strictly increase: never empty
+            weight[labels[k]] = weight.get(labels[k], 0.0) + _run_dur([flat[k]])
+        first = labels[s]
+        best = max(weight, key=lambda lb: (weight[lb], lb == first))
+        for k in range(s, e):
+            new_labels[k] = best
+    out: list[tuple[str, list[dict]]] = []
+    for a, lb in zip(flat, new_labels):
+        if out and out[-1][0] == lb:
+            out[-1][1].append(a)
+        else:
+            out.append((lb, [a]))
+    return out
+
+
+def _snap_runs_to_pauses(
+    runs: list[tuple[str, list[dict]]], lang: str
+) -> list[tuple[str, list[dict]]]:
     """Move each run boundary to the nearest edge where the voice actually pauses.
 
     A speaker change follows a breath, so the only legal boundaries are the places with
@@ -174,40 +219,60 @@ def _snap_runs_to_phrases(
     if not _no_spaces(lang) or len(runs) < 2:
         return runs
 
+    from voxweave.core.smart_split import _phrase_boundary_atoms
+
     flat = [a for _, ats in runs for a in ats]
     if len(flat) < 2:
         return runs
-    candidates = {0, len(flat)}
+    text = "".join(a["text"] for a in flat)
+    pausable = {0, len(flat)}
     for i in range(1, len(flat)):
         before, after = flat[i - 1].get("end"), flat[i].get("start")
-        if before is None or after is None:
-            continue
-        if float(after) - float(before) >= MIN_BOUNDARY_GAP_S:
-            candidates.add(i)
-    ordered = sorted(candidates)
+        if before is not None and after is not None:
+            if float(after) - float(before) >= MIN_BOUNDARY_GAP_S:
+                pausable.add(i)
+    phrases = _phrase_boundary_atoms([{"text": a["text"]} for a in flat], text, lang) | {0, len(flat)}
 
     bounds: list[int] = []
     cursor = 0
     for _label, atoms in runs[:-1]:
         cursor += len(atoms)
         bounds.append(cursor)
-    moved = [min(ordered, key=lambda c: (abs(c - b), c)) for b in bounds]
 
-    edges = [0, *moved, len(flat)]
-    # A boundary may snap onto its neighbour's position; merge the run that vanishes into
-    # the previous one instead of dropping its atoms.
+    def nearest(candidates: set[int], b: int) -> int | None:
+        best = min(candidates, key=lambda c: (abs(c - b), c))
+        return best if abs(best - b) <= MAX_BOUNDARY_MOVE_ATOMS else None
+
+    # A boundary only survives if it can reach a place a voice can actually change at:
+    # a pause first, then a phrase edge nearby, otherwise the two runs are merged. Merging
+    # is the safe answer -- the previous behaviour kept the boundary and produced
+    # '違' | 'いますって' style cuts whenever the diarizer cut inside a word.
+    targets: list[int | None] = []
+    for b in bounds:
+        target = nearest(pausable, b)
+        if target is None:
+            target = nearest(phrases, b)
+        targets.append(target)
+
     out: list[tuple[str, list[dict]]] = []
-    for i, (label, _atoms) in enumerate(runs):
-        s0, e0 = edges[i], edges[i + 1]
-        if e0 <= s0:
-            if out:
-                out[-1] = (out[-1][0], out[-1][1] + list(runs[i][1]))
+    current_start = 0
+    current_label = runs[0][0]
+    for i, target in enumerate(targets):
+        if target is None:
+            # Absorb run i+1 into the current one: the boundary was not a real change.
             continue
-        atoms = flat[s0:e0]
-        if out and out[-1][0] == label:
-            out[-1] = (label, out[-1][1] + atoms)
-        else:
-            out.append((label, atoms))
+        atoms = flat[current_start:target]
+        if atoms and out and out[-1][0] == current_label:
+            out[-1] = (current_label, out[-1][1] + atoms)
+        elif atoms:
+            out.append((current_label, atoms))
+        current_start = target
+        current_label = runs[i + 1][0]
+    tail = flat[current_start:]
+    if tail and out and out[-1][0] == current_label:
+        out[-1] = (current_label, out[-1][1] + tail)
+    elif tail:
+        out.append((current_label, tail))
     return out or runs
 
 
@@ -348,7 +413,14 @@ def _speaker_runs(
     if len(runs) <= 1:
         return runs
     runs = _absorb_tiny_runs(runs)
-    runs = _snap_runs_to_phrases(runs, lang)
+    # A cue that the voice split cut gets the conservative snap: those boundaries come from
+    # a measured voice change and must stay next to the pause that produced them. Every
+    # other cue keeps the phrase snap, unchanged -- rewriting its boundaries as well cut
+    # ordinary words in half ("違" | "いますって") with no measured reason to move them.
+    if any(_SPLIT_LABEL.search(label) for label, _atoms in runs):
+        runs = _snap_runs_to_pauses(runs, lang)
+    else:
+        runs = _snap_runs_to_phrases(runs, lang)
     return _merge_bad_tail_runs(runs, lang)
 
 
