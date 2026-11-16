@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import soundfile as sf
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from voxweave import artifacts, backend, chunking, config, realign, songdet
 from voxweave.chunking import (
+    SAMPLE_RATE,
     decode_to_wav,
     pack_speech_segments,
     silence_gaps,
@@ -374,6 +376,49 @@ def _diarize_audio_profile(
 # the voiceprint capture. The two try levels stay separate on purpose: the inner
 # finally frees pyannote before the capture loads its embedder, the outer one frees
 # a kept clustering embedder on any path that never reaches the capture.
+def _refine_turns_by_voice(
+    wav: Path,
+    turns: list[tuple[float, float, str]],
+    units: list[dict],
+    iso: str,
+    voiceprint_model: str | None,
+) -> list[tuple[float, float, str]]:
+    """Split a diarizer turn where the voice inside it changes (see voxweave.turnsplit).
+
+    pyannote decides the turn boundaries; when two speakers land inside one turn nothing
+    downstream can separate them, and the layout renders one line with two people in it.
+    Re-embedding the pieces either side of an internal pause catches exactly that case.
+
+    Optional refinement: any failure (no embedder, unreadable audio, a rejected span) logs
+    at debug and leaves the diarizer's turns untouched, so a run can never fail because of
+    it. Disable with VOXWEAVE_TURN_SPLIT=0.
+    """
+    if not config._env_flag("VOXWEAVE_TURN_SPLIT", True):
+        return turns
+    try:
+        from voxweave import voiceembed
+        from voxweave.turnsplit import split_turns_by_voice
+
+        spec = voiceembed.resolve_voiceprint_model(voiceprint_model, iso)
+        if not isinstance(spec, voiceembed.EmbedderSpec):
+            return turns
+        data, sr = sf.read(str(wav), dtype="float32")
+        if sr != SAMPLE_RATE:
+            return turns
+        refined, splits = split_turns_by_voice(
+            turns,
+            units,
+            lambda spans: voiceembed.embed_segments(data, spans, spec),
+            floor=float(spec.suggest),
+        )
+        if splits:
+            log.info("voice split: %d turn(s) held more than one voice", splits)
+        return refined
+    except Exception as exc:  # noqa: BLE001 - an optional refinement must not fail a run
+        log.debug("voice turn split skipped: %r", exc)
+        return turns
+
+
 def _identify_speakers(
     wav: Path,
     iso: str,
@@ -928,6 +973,10 @@ def transcribe(
                     separator_identity=acquired.separator,
                 ),
                 rep=rep,
+            )
+        if speaker_turns:
+            speaker_turns = _refine_turns_by_voice(
+                acquired.wav, speaker_turns, all_units, iso, voiceprint_model
             )
         panns_handoff = not release_panns
         return (
