@@ -393,13 +393,12 @@ def _refine_turns_by_voice(
     at debug and leaves the diarizer's turns untouched, so a run can never fail because of
     it. Enable with VOXWEAVE_TURN_SPLIT=1.
 
-    **Off by default: the pairwise test does not hold up.** On episode 02 it split 75 of
-    575 turns, fragmenting one 5.9 s exchange into six pieces and cutting a phrase in half
-    ("レポート しょうが" / "ないっすね"). Re-embedding the same three utterances showed
-    why: with anime-va, two pieces of the *same* speaker scored 0.225 while two *different*
-    speakers scored 0.455, so a short piece cannot be compared to its neighbour at all.
-    The approach needs per-speaker centroids built from many samples (global clustering
-    over the episode's pieces) before it can be trusted; until then this stays opt-in.
+    The turn-level result is right -- on the disputed A-B-A-B exchange the four pieces
+    score 0.425 / 0.524 / 0.377 / 0.672 against their centroids, exactly alternating --
+    but the cue layer is not ready for it: render_speaker_cues snaps a speaker boundary onto
+    a phrase edge, and the phrase edges inside "レポート、しょうがないっすね" land
+    mid-word ("しょうが" / "ないっすね"). Until that snap respects the boundary, the
+    refinement stays opt-in behind VOXWEAVE_TURN_SPLIT=1.
     """
     if not config._env_flag("VOXWEAVE_TURN_SPLIT", False):
         return turns
@@ -417,7 +416,6 @@ def _refine_turns_by_voice(
             turns,
             units,
             lambda spans: voiceembed.embed_segments(data, spans, spec),
-            floor=float(spec.suggest),
         )
         if splits:
             log.info("voice split: %d turn(s) held more than one voice", splits)

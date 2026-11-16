@@ -1,28 +1,24 @@
 """Split a diarizer turn where the voice inside it changes.
 
 pyannote decides *where* turns begin and end; the clustering step only labels those turns.
-When the model puts two speakers inside one turn -- measured on a broadcast anime episode,
-a 5.9 s turn held two exchanges -- nothing downstream can separate them: raising
-``min_speakers`` only relabels, and both the community-1 and 3.1 pipelines produce the very
-same turn. The layout then renders one line with two people in it, and the translator has
-no way to tell who says what.
+When two speakers land inside one turn nothing downstream can separate them -- raising
+``min_speakers`` only relabels, and community-1 and 3.1 emit the very same turn. The layout
+then renders one line with two people in it, and the translator cannot tell who says what.
 
-The evidence for a split is inside the turn: a speaker's turns are separated by pauses, and
-a voice change is audible even when pyannote did not cut there. So:
+Two things had to be measured before this worked:
 
-1. take a long turn,
-2. cut it at the word gaps inside it (a real takeover starts after a breath),
-3. embed each piece with the same voice model ``--voiceprints`` uses (``anime-va`` for
-   Japanese, an ECAPA-TDNN trained on anime voice actors),
-4. split where adjacent pieces fall below the embedder's own same-speaker threshold.
+* **Cut points are punctuation, not pauses.** Inside a turn the aligner leaves 0.16-0.30 s
+  gaps between characters, and the real line boundary (0.24 s) is indistinguishable from
+  that noise: cutting on gaps split ``何の/接点`` mid-phrase. A speaker change in dialogue
+  lands after 「、」「。」「?」, so the cut set is those units.
+* **Compare against centroids, not the neighbour.** A 1.4 s piece compared to the piece
+  beside it is unreliable: with anime-va two pieces of the *same* speaker scored 0.225
+  while two *different* speakers scored 0.455. Compared to per-speaker centroids built
+  from many turns, the same pieces read 0.383 / 0.578 and the boundary is visible.
 
-Measured on the disputed turn (233.0-238.9 s): the two pieces either side of the 234.6 s
-pause score cosine -0.011 (different voices) while the next pair scores 0.455 (same
-voice, ``anime-va`` suggests 0.35 as the boundary). pyannote had called all of it one
-speaker.
-
-Everything here is pure: the embedder is injected, so the rules are testable without a
-model and without audio.
+A piece only counts when its best centroid beats the runner-up by ``margin``; otherwise the
+turn keeps the diarizer's label. That gate is what keeps an A-B-A exchange as A-B-A
+instead of letting a weak third assignment split it again.
 """
 
 from __future__ import annotations
@@ -32,56 +28,115 @@ import math
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import numpy as np
+
 log = logging.getLogger("voxweave")
 
 Turn = tuple[float, float, str]
 
-#: Only turns at least this long are candidates: a short turn cannot hold two speakers, and
-#: embedding it costs a forward pass.
+#: Only turns at least this long are candidates: a short turn cannot hold two speakers.
 MIN_TURN_S = 2.5
-#: A pause inside the turn this long is a plausible takeover point.
-MIN_GAP_S = 0.25
-#: The embedder needs this much audio to say anything (anime-va's own floor is 1.0 s).
+#: The pieces either side of a cut must be this long before the embedder says anything
+#: (anime-va's own floor is 1.0 s).
 MIN_PIECE_S = 1.0
-#: Cosine below this means "different voice". The value comes from the embedder spec
-#: (``suggest``); this is only the fallback when the caller does not pass one.
-DEFAULT_FLOOR = 0.35
-#: New pieces shorter than this are folded into their neighbour: a 0.4 s fragment is not a
-#: cue, and the layout would extend it into the pause anyway.
-MIN_NEW_PIECE_S = 0.6
+#: A turn shorter than this is not worth a centroid sample.
+CENTROID_MIN_TURN_S = 1.5
+#: How many samples a speaker needs before its centroid is trusted.
+CENTROID_MIN_SAMPLES = 3
+#: How far the best centroid must beat the runner-up before an assignment is used.
+DEFAULT_MARGIN = 0.15
+
+#: Clause and sentence punctuation. A comma is a real speaker boundary in dialogue: on the
+#: disputed turn the exchange is A-B-A-B, with ``レポート、`` and ``しょうがないっすね。``
+#: alternating -- cutting only at sentence enders merges them into one piece.
+CUT_PUNCT = frozenset("、。，．？！…‥,.!?")
 
 
-def _piece_spans(
-    turn: Turn, units: Sequence[dict[str, Any]], min_gap_s: float, min_piece_s: float
-) -> list[tuple[float, float]]:
-    """Cut ``turn`` at its internal word gaps, keeping pieces long enough to embed."""
+def _cut_after(unit: dict[str, Any]) -> bool:
+    text = str(unit.get("text") or unit.get("word") or "").strip()
+    return bool(text) and text[-1] in CUT_PUNCT
+
+
+def _pieces(turn: Turn, units: Sequence[dict[str, Any]], min_piece_s: float) -> list[tuple[float, float]]:
+    """Cut ``turn`` after its clause punctuation, merging pieces too short to embed."""
     start, end, _label = turn
     inside = sorted(
-        (float(u["start"]), float(u["end"]))
-        for u in units
-        if u.get("start") is not None
-        and u.get("end") is not None
-        and float(u["start"]) >= start - 1e-6
-        and float(u["end"]) <= end + 1e-6
+        (
+            (float(u["start"]), float(u["end"]), u)
+            for u in units
+            if u.get("start") is not None
+            and u.get("end") is not None
+            and float(u["start"]) >= start - 1e-6
+            and float(u["end"]) <= end + 1e-6
+        ),
+        key=lambda row: (row[0], row[1]),
     )
     if len(inside) < 2:
         return [(start, end)]
-    cuts: list[float] = []
-    for (_ps, pe), (ns, _ne) in zip(inside, inside[1:]):
-        if ns - pe >= min_gap_s:
-            cuts.append((pe + ns) / 2.0)
+    cuts = [pe for (_ps, pe, u) in inside[:-1] if _cut_after(u)]
     if not cuts:
         return [(start, end)]
     bounds = [start, *cuts, end]
+    # Accumulate until a piece is long enough to embed. A 0.1 s scrap (the punctuation
+    # unit itself often sits at zero width) must never become its own piece: it carries no
+    # voice, and the embedder rejects it.
     pieces: list[tuple[float, float]] = []
-    for a, b in zip(bounds, bounds[1:]):
-        if pieces and b - a < min_piece_s:
-            pieces[-1] = (pieces[-1][0], b)  # too short to embed: join the left piece
-        elif not pieces and b - a < min_piece_s:
-            pieces.append((a, b))  # the first piece sets the anchor even if short
+    anchor = bounds[0]
+    for edge in bounds[1:]:
+        if edge - anchor >= min_piece_s:
+            pieces.append((anchor, edge))
+            anchor = edge
+    if anchor < bounds[-1]:
+        if pieces:
+            pieces[-1] = (pieces[-1][0], bounds[-1])
         else:
-            pieces.append((a, b))
+            pieces.append((anchor, bounds[-1]))
     return pieces or [(start, end)]
+
+
+def build_centroids(
+    turns: Sequence[Turn],
+    embed: Callable[[Sequence[tuple[float, float]]], Any],
+    *,
+    min_turn_s: float = CENTROID_MIN_TURN_S,
+    min_samples: int = CENTROID_MIN_SAMPLES,
+) -> dict[str, np.ndarray]:
+    """One unit-length centroid per speaker, from that speaker's longer turns."""
+    by_label: dict[str, list[tuple[float, float]]] = {}
+    for start, end, label in sorted(turns):
+        if end - start >= min_turn_s:
+            by_label.setdefault(label, []).append((start, end))
+    usable = {k: v for k, v in by_label.items() if len(v) >= min_samples}
+    if len(usable) < 2:
+        return {}
+    spans = [span for group in usable.values() for span in group]
+    matrix = np.asarray(embed(spans), dtype=np.float64)
+    centroids: dict[str, np.ndarray] = {}
+    offset = 0
+    for label, group in usable.items():
+        rows = matrix[offset : offset + len(group)]
+        offset += len(group)
+        mean = rows.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm > 1e-9:
+            centroids[label] = mean / norm
+    return centroids
+
+
+def _assign(
+    row: np.ndarray, centroids: dict[str, np.ndarray], fallback: str, margin: float
+) -> str:
+    scores = sorted(
+        ((float(np.dot(row, vector)), label) for label, vector in centroids.items()),
+        reverse=True,
+    )
+    if len(scores) < 2:
+        return fallback
+    best, best_label = scores[0]
+    second = scores[1][0]
+    if not math.isfinite(best) or best - second < margin:
+        return fallback
+    return best_label
 
 
 def split_turns_by_voice(
@@ -89,21 +144,29 @@ def split_turns_by_voice(
     units: Sequence[dict[str, Any]],
     embed: Callable[[Sequence[tuple[float, float]]], Any],
     *,
-    floor: float = DEFAULT_FLOOR,
+    margin: float = DEFAULT_MARGIN,
     min_turn_s: float = MIN_TURN_S,
-    min_gap_s: float = MIN_GAP_S,
     min_piece_s: float = MIN_PIECE_S,
+    centroids: dict[str, np.ndarray] | None = None,
 ) -> tuple[list[Turn], int]:
     """Return ``(turns, splits)`` with voices separated inside long turns.
 
     ``embed(spans)`` returns an ``[N, D]`` matrix of L2-normalised vectors, one per span
-    (``voxweave.voiceembed.embed_segments``). A turn is only touched when every candidate
-    piece embeds successfully; any failure leaves that turn exactly as the diarizer left
-    it, because a guessed split is worse than a merged line.
+    (``voxweave.voiceembed.embed_segments``). Every failure path returns the diarizer's
+    turns untouched: a guessed split is worse than a merged line.
     """
     if not turns:
         return [], 0
     ordered = sorted(turns)
+    if centroids is None:
+        try:
+            centroids = build_centroids(ordered, embed)
+        except Exception as exc:  # noqa: BLE001 - optional refinement
+            log.debug("voice split: no centroids (%s)", exc)
+            return list(ordered), 0
+    if len(centroids) < 2:
+        return list(ordered), 0
+
     out: list[Turn] = []
     splits = 0
     for turn in ordered:
@@ -111,41 +174,32 @@ def split_turns_by_voice(
         if end - start < min_turn_s:
             out.append(turn)
             continue
-        pieces = _piece_spans(turn, units, min_gap_s, min_piece_s)
+        pieces = _pieces(turn, units, min_piece_s)
         if len(pieces) < 2:
             out.append(turn)
             continue
         try:
-            matrix = embed(pieces)
-        except Exception as exc:  # noqa: BLE001 - an optional refinement must not fail a run
+            matrix = np.asarray(embed(pieces), dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001 - optional refinement
             log.debug("voice split skipped at %.2fs: %s", start, exc)
             out.append(turn)
             continue
-        keep = [0]
-        for i in range(1, len(pieces)):
-            sim = float(sum(a * b for a, b in zip(matrix[i - 1], matrix[i])))
-            if not math.isfinite(sim) or sim < floor:
-                keep.append(i)
-        if len(keep) < 2:
+        labels = [_assign(row, centroids, label, margin) for row in matrix]
+        if all(new == labels[0] for new in labels):
             out.append(turn)
             continue
-        bounds = keep + [len(pieces)]
-        for k, (a, b) in enumerate(zip(bounds, bounds[1:])):
-            p_start, p_end = pieces[a][0], pieces[b - 1][1]
-            if (
-                p_end - p_start < MIN_NEW_PIECE_S
-                and out
-                and abs(out[-1][1] - p_start) < 1e-6
-            ):
-                # Fold a scrap into the piece before it instead of emitting a flash cue.
-                out[-1] = (out[-1][0], p_end, out[-1][2])
+        group_start = 0
+        for i in range(1, len(pieces) + 1):
+            if i < len(pieces) and labels[i] == labels[group_start]:
                 continue
-            if k == 0:
+            p_start = pieces[group_start][0]
+            p_end = pieces[i - 1][1]
+            if group_start == 0:
                 out.append((p_start, p_end, label))
             else:
-                # A new label, derived so it stays traceable to the turn it came from
-                # (SPEAKER_09 -> SPEAKER_09r1). Names are mapped per id downstream, so an
-                # unmapped id simply has no name yet.
                 splits += 1
-                out.append((p_start, p_end, f"{label}r{k}"))
+                # Traceable to the turn it came from (SPEAKER_09 -> SPEAKER_09r2); names
+                # are mapped per id downstream, so an unmapped id simply has no name yet.
+                out.append((p_start, p_end, f"{label}r{group_start}"))
+            group_start = i
     return out, splits
