@@ -391,16 +391,15 @@ def _refine_turns_by_voice(
 
     Optional refinement: any failure (no embedder, unreadable audio, a rejected span) logs
     at debug and leaves the diarizer's turns untouched, so a run can never fail because of
-    it. Enable with VOXWEAVE_TURN_SPLIT=1.
+    it. Disable with VOXWEAVE_TURN_SPLIT=0.
 
-    The turn-level result is right -- on the disputed A-B-A-B exchange the four pieces
-    score 0.425 / 0.524 / 0.377 / 0.672 against their centroids, exactly alternating --
-    but the cue layer is not ready for it: render_speaker_cues snaps a speaker boundary onto
-    a phrase edge, and the phrase edges inside "レポート、しょうがないっすね" land
-    mid-word ("しょうが" / "ないっすね"). Until that snap respects the boundary, the
-    refinement stays opt-in behind VOXWEAVE_TURN_SPLIT=1.
+    On the disputed A-B-A-B exchange the four pieces score 0.425 / 0.524 / 0.377 / 0.672
+    against their centroids -- exactly alternating -- and the cue layer now renders them as
+    four separate cues. The snap that used to break that (it reassigned whole BudouX
+    phrases and could move a boundary three characters) now only moves a boundary to the
+    nearest audible pause.
     """
-    if not config._env_flag("VOXWEAVE_TURN_SPLIT", False):
+    if not config._env_flag("VOXWEAVE_TURN_SPLIT", True):
         return turns
     try:
         from voxweave import voiceembed

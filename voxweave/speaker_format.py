@@ -53,6 +53,11 @@ BAD_TAIL_PENALTY = 2
 # (same order as MIN_RUN_S: shorter than any real turn-taking beat).
 BAD_TAIL_MAX_GAP_S = 0.2
 
+#: A speaker boundary may only sit where the voice actually pauses. Inside a turn the
+#: aligner leaves 0.03-0.05 s between atoms of one word and 0.1 s or more between words,
+#: so this floor separates "the next word" from "the next frame".
+MIN_BOUNDARY_GAP_S = 0.08
+
 Turn = tuple[float, float, str]
 
 
@@ -153,41 +158,57 @@ def _absorb_tiny_runs(
 def _snap_runs_to_phrases(
     runs: list[tuple[str, list[dict]]], lang: str
 ) -> list[tuple[str, list[dict]]]:
-    """Snap run boundaries onto legal token edges so a run never cuts mid-word.
+    """Move each run boundary to the nearest edge where the voice actually pauses.
 
-    No-space langs only (space-delimited atoms are already whole words). Each
-    jieba/BudouX phrase is reassigned to its dominant speaker (by atom duration),
-    which is exactly a boundary snap: a phrase spanning a mid-word label flip
-    goes wholly to one speaker instead of splitting. Reuses the phrase-boundary
-    machinery smart_split uses (``_phrase_boundary_atoms`` -> ``phrase_atoms``).
+    A speaker change follows a breath, so the only legal boundaries are the places with
+    audible silence between atoms. The boundary is moved to the *nearest* such edge and no
+    further: reassigning whole BudouX phrases instead (the previous behaviour) let a
+    boundary travel three characters -- ``レポート | しょうがない`` became
+    ``レポートしょうが | ない``, cutting a word in half on every episode that had any
+    speaker split at all.
+
+    No-space languages only (space-delimited atoms are already whole words).
     """
     from voxweave.core.layout import _no_spaces
 
     if not _no_spaces(lang) or len(runs) < 2:
         return runs
-    from voxweave.core.smart_split import _phrase_boundary_atoms
 
     flat = [a for _, ats in runs for a in ats]
-    labels = [lb for lb, ats in runs for _ in ats]
-    text = "".join(a["text"] for a in flat)
-    boundaries = _phrase_boundary_atoms([{"text": a["text"]} for a in flat], text, lang)
-    edges = sorted(boundaries | {0, len(flat)})
-    new_labels = list(labels)
-    for s, e in zip(edges, edges[1:]):
-        weight: dict[str, float] = {}
-        for k in range(s, e):  # edges strictly increase: never empty
-            weight[labels[k]] = weight.get(labels[k], 0.0) + _run_dur([flat[k]])
-        first = labels[s]
-        best = max(weight, key=lambda lb: (weight[lb], lb == first))
-        for k in range(s, e):
-            new_labels[k] = best
+    if len(flat) < 2:
+        return runs
+    candidates = {0, len(flat)}
+    for i in range(1, len(flat)):
+        before, after = flat[i - 1].get("end"), flat[i].get("start")
+        if before is None or after is None:
+            continue
+        if float(after) - float(before) >= MIN_BOUNDARY_GAP_S:
+            candidates.add(i)
+    ordered = sorted(candidates)
+
+    bounds: list[int] = []
+    cursor = 0
+    for _label, atoms in runs[:-1]:
+        cursor += len(atoms)
+        bounds.append(cursor)
+    moved = [min(ordered, key=lambda c: (abs(c - b), c)) for b in bounds]
+
+    edges = [0, *moved, len(flat)]
+    # A boundary may snap onto its neighbour's position; merge the run that vanishes into
+    # the previous one instead of dropping its atoms.
     out: list[tuple[str, list[dict]]] = []
-    for a, lb in zip(flat, new_labels):
-        if out and out[-1][0] == lb:
-            out[-1][1].append(a)
+    for i, (label, _atoms) in enumerate(runs):
+        s0, e0 = edges[i], edges[i + 1]
+        if e0 <= s0:
+            if out:
+                out[-1] = (out[-1][0], out[-1][1] + list(runs[i][1]))
+            continue
+        atoms = flat[s0:e0]
+        if out and out[-1][0] == label:
+            out[-1] = (label, out[-1][1] + atoms)
         else:
-            out.append((lb, [a]))
-    return out
+            out.append((label, atoms))
+    return out or runs
 
 
 def _run_gap(left: list[dict], right: list[dict]) -> float:
