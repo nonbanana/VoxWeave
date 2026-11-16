@@ -28,6 +28,13 @@ from voxweave.core.smart_split import _unit_text
 #: monotonically, so a genuine held syllable spans *continuously*.
 STRANDED_TAIL_GAP_S = 2.0
 
+#: Upper bound for the same distance. A stranded tail is the *word's own* vowel landing a
+#: few seconds past its body (the observed cases are 3-6 s); a unit a minute away is a
+#: separate utterance, and moving it re-attaches real dialogue to an earlier line. Measured
+#: on episode 02, this gate was pulling ``よし、`` back across the 65 s opening from 130.48 s
+#: to 26.1 s, so the line before the OP gained a word that belongs to the line after it.
+MAX_STRANDED_TAIL_GAP_S = 10.0
+
 #: The gap must contain at least this much continuous VAD-confirmed silence:
 #: a stranded tail sits across dead air, an ASR under-segmentation does not.
 SILENT_RUN_MIN_S = 1.0
@@ -112,7 +119,7 @@ def repair_stranded_tails(
         if us is None or pe is None:
             continue
         gap = float(us) - float(pe)
-        if gap <= STRANDED_TAIL_GAP_S:
+        if gap <= STRANDED_TAIL_GAP_S or gap > MAX_STRANDED_TAIL_GAP_S:
             continue
         if _max_silent_run(float(pe), float(us), speech_spans) < SILENT_RUN_MIN_S:
             continue

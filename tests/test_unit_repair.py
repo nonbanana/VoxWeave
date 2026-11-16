@@ -70,3 +70,18 @@ def test_no_vad_evidence_means_no_repair():
 def test_spaced_language_is_untouched():
     units = _units(("weak", 0.0, 0.2), ("ly", 9.0, 9.1))
     assert repair_stranded_tails(units, "en", [(0.0, 0.4), (9.0, 9.2)]) == units
+
+
+def test_a_unit_a_minute_away_is_not_a_stranded_tail():
+    """Episode 02: ``よし、`` at 130.48 s was pulled back across the 65 s opening to
+    26.1 s, moving a real line from after the OP to before it."""
+    units = _units(("ね", 25.9, 26.1), ("よ", 130.48, 130.54))
+    out = repair_stranded_tails(units, "ja", [(21.3, 26.5), (131.0, 133.0)])
+    assert out[1]["start"] == 130.48
+
+
+def test_a_tail_a_few_seconds_away_is_still_repaired():
+    """The repair exists for this: a held vowel landing seconds past the word body."""
+    units = _units(("ぎ", 772.8, 773.0), ("ゅ", 778.0, 778.2))
+    out = repair_stranded_tails(units, "ja", [(772.5, 773.4), (777.9, 778.3)])
+    assert out[1]["start"] == 773.0
