@@ -22,6 +22,12 @@ def test_payload_omits_the_key_when_unnamed() -> None:
     assert "sp" not in payload[0]
 
 
+def test_a_real_name_never_reaches_the_prompt() -> None:
+    """`test_speakers` pins this: a name in the payload can come back in the output."""
+    payload = build_payload([{"text": "こんにちは", "speaker": "梅"}])
+    assert "sp" not in payload[0]
+
+
 def test_dash_cue_keeps_its_parts() -> None:
     payload = build_payload([{"text": "-はい\n-いいえ", "speakers": ["A", "B"]}])
     assert payload[0]["parts"] == ["はい", "いいえ"]

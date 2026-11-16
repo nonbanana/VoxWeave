@@ -163,7 +163,11 @@ def build_payload(blocks: list[dict]) -> list[dict]:
         # line as an unanchored utterance, which is where pronoun and register mistakes
         # come from. A stable id per speaker is enough -- it does not need a name.
         speaker = b.get("speaker") or b.get("speakers")
-        if isinstance(speaker, str) and speaker.strip():
+        # Only a synthetic id travels: a real name in the prompt can come back in the
+        # translation, which is the leak `test_speakers` pins ("names out of payload").
+        # tools/label_speakers.py writes S1..Sn, so diarized episodes still get the
+        # benefit without exposing who is who.
+        if isinstance(speaker, str) and _SPEAKER_ID.fullmatch(speaker.strip()):
             entry["sp"] = speaker.strip()
         if not b.get("lyric") and is_dash_cue(text):
             entry["parts"] = _dash_parts(text)
@@ -172,6 +176,8 @@ def build_payload(blocks: list[dict]) -> list[dict]:
 
 
 _ECHOED_SPEAKER = re.compile(r"^\s*\[?S\d+\]?\s*[:：]?\s*")
+# A synthetic speaker handle, never a real name (see build_payload).
+_SPEAKER_ID = re.compile(r"S\d+")
 
 
 def parse_response(raw: object) -> dict[int, str]:
